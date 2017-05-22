@@ -916,17 +916,61 @@ int main(int argc, char *argv[]) {
     cmdLine.append(L"\" -c ");
     appendBashArg(cmdLine, bashCmdLine);
 
-    STARTUPINFOW sui = {};
-    sui.cb = sizeof(sui);
+
+
+    BOOL success {};
+    SECURITY_ATTRIBUTES secAttr {};
+    secAttr = { sizeof(secAttr), nullptr, true };
+    HANDLE failInputRead {}, failInputWrite {};
+    success = CreatePipe(&failInputRead, &failInputWrite, &secAttr, 0);
+    assert(success && "CreatePipe failed");
+    secAttr = { sizeof(secAttr), nullptr, true };
+    HANDLE failOutputRead {}, failOutputWrite {};
+    success = CreatePipe(&failOutputRead, &failOutputWrite, &secAttr, 0);
+    assert(success && "CreatePipe failed");
+
+
+
+
+
+
+    STARTUPINFOEXW sui {};
+    sui.StartupInfo.cb = sizeof(sui);
+
+
+
+    SIZE_T size {};
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    assert(size > 0 && "InitializeProcThreadAttributeList failed");
+    std::unique_ptr<char[]> attrListBuffer(new char[size]);
+    PPROC_THREAD_ATTRIBUTE_LIST attrList =
+        reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attrListBuffer.get());
+    sui.lpAttributeList = attrList;
+    success = InitializeProcThreadAttributeList(attrList, 1, 0, &size);
+    assert(success && "InitializeProcThreadAttributeList failed");
+
+
+
+    HANDLE inheritList[] = { failInputRead, failOutputWrite };
+    success = UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        inheritList, sizeof(inheritList), nullptr, nullptr);
+    assert(success && "UpdateProcThreadAttribute failed");
+
+
+
+
+
+
     PROCESS_INFORMATION pi = {};
-    BOOL success = CreateProcessW(bashPath.c_str(), &cmdLine[0], nullptr, nullptr,
-        false,
+    success = CreateProcessW(bashPath.c_str(), &cmdLine[0], nullptr, nullptr,
+        true,
         debugFork ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW,
-        nullptr, nullptr, &sui, &pi);
+        nullptr, nullptr, &sui.StartupInfo, &pi);
     if (!success) {
         fatal("error starting bash.exe adapter: %s\n",
             formatErrorMessage(GetLastError()).c_str());
     }
+    DeleteProcThreadAttributeList(attrList);
 
     std::atomic<bool> backendStarted = { false };
 
