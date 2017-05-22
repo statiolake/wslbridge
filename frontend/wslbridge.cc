@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <locale.h>
@@ -777,6 +778,8 @@ public:
         assert(success && "InitializeProcThreadAttributeList failed");
         attrList = get();
     }
+    StartupInfoAttributeList(const StartupInfoAttributeList &) = delete;
+    StartupInfoAttributeList &operator=(const StartupInfoAttributeList &) = delete;
     ~StartupInfoAttributeList() {
         DeleteProcThreadAttributeList(get());
     }
@@ -798,9 +801,119 @@ public:
             nullptr, nullptr);
         assert(success && "UpdateProcThreadAttribute failed");
     }
+    StartupInfoInheritList(const StartupInfoInheritList &) = delete;
+    StartupInfoInheritList &operator=(const StartupInfoInheritList &) = delete;
+    ~StartupInfoInheritList() {}
 private:
     std::vector<HANDLE> inheritList_;
 };
+
+// WSL bash will print an error if the user tries to run elevated and
+// non-elevated instances simultaneously, and maybe other situations.  We'd
+// like to detect this situation and report the error back to the user.
+//
+// Two complications:
+//  - WSL bash will print the error to stdout/stderr, but if the file is a
+//    pipe, then WSL bash doesn't print it until it exits (presumably due to
+//    block buffering).
+//  - WSL bash puts up a prompt, "Press any key to continue", and it reads
+//    that key from the attached console, not from stdin.
+//
+// This function spawns the frontend again and instructs it to attach to the
+// new WSL bash console and send it a return keypress.
+//
+// The HANDLE should be inheritable so the PID isn't reused prematurely.
+static void spawnPressReturnProcess(HANDLE bashProcess) {
+    const auto exePath = getModuleFileName(getCurrentModule());
+    std::wstring cmdline;
+    cmdline.append(L"\"");
+    cmdline.append(exePath);
+    cmdline.append(L"\" --press-return ");
+    cmdline.append(std::to_wstring(GetProcessId(bashProcess)));
+    STARTUPINFOEXW sui {};
+    sui.StartupInfo.cb = sizeof(sui);
+    StartupInfoAttributeList attrList { sui.lpAttributeList, 1 };
+    StartupInfoInheritList inheritList { sui.lpAttributeList, { bashProcess } };
+    PROCESS_INFORMATION pi {};
+    const BOOL success = CreateProcessW(exePath.c_str(), &cmdline[0], nullptr, nullptr,
+        true, DETACHED_PROCESS, nullptr, nullptr, &sui.StartupInfo, &pi);
+    if (!success) {
+        fprintf(stderr, "wslbridge warning: could not spawn: %s\n", wcsToMbs(cmdline).c_str());
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
+
+static int handlePressReturn(const char *pidStr) {
+    // AttachConsole replaces STD_INPUT_HANDLE with a new console input
+    // handle.  See https://github.com/rprichard/win32-console-docs.  The
+    // bash.exe process has already started, but console creation and
+    // process creation don't happen atomically, so poll for the console's
+    // existence.
+    const int bashPid = atoi(pidStr);
+    FreeConsole();
+    for (int i = 0; i < 100; ++i) {
+        if (AttachConsole(bashPid)) {
+            std::array<INPUT_RECORD, 2> ir {};
+            ir[0].EventType = KEY_EVENT;
+            ir[0].Event.KeyEvent.bKeyDown = TRUE;
+            ir[0].Event.KeyEvent.wRepeatCount = 1;
+            ir[0].Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
+            ir[0].Event.KeyEvent.wVirtualScanCode = MapVirtualKey(VK_RETURN, MAPVK_VK_TO_VSC);
+            ir[0].Event.KeyEvent.uChar.UnicodeChar = '\r';
+            ir[1] = ir[0];
+            ir[1].Event.KeyEvent.bKeyDown = FALSE;
+            DWORD actual {};
+            WriteConsoleInputW(
+                GetStdHandle(STD_INPUT_HANDLE),
+                ir.data(), ir.size(), &actual);
+            return 0;
+        }
+        Sleep(100);
+    }
+    return 1;
+}
+
+static std::vector<char> readAllFromHandle(HANDLE h) {
+    std::vector<char> ret;
+    char buf[1024];
+    DWORD actual {};
+    while (ReadFile(h, buf, sizeof(buf), &actual, nullptr) && actual > 0) {
+        ret.insert(ret.end(), buf, buf + actual);
+    }
+    return ret;
+}
+
+static std::tuple<DWORD, DWORD, DWORD> windowsVersion() {
+    OSVERSIONINFO info {};
+    info.dwOSVersionInfoSize = sizeof(info);
+    const BOOL success = GetVersionEx(&info);
+    assert(success && "GetVersionEx failed");
+    if (info.dwMajorVersion == 6 && info.dwMinorVersion == 2) {
+        // We want to distinguish between Windows 10.0.14393 and 10.0.15063,
+        // but if the EXE doesn't have an appropriate manifest, then
+        // GetVersionEx will report the lesser of 6.2 and the true version.
+        fprintf(stderr, "wslbridge warning: GetVersionEx reports version 6.2 -- "
+            "is wslbridge.exe properly manifested?\n");
+    }
+    return std::make_tuple(info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
+}
+
+static std::string replaceAll(std::string str, const std::string &from, const std::string &to) {
+    size_t pos {};
+    while ((pos = str.find(from, pos)) != std::string::npos) {
+        str = str.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return str;
+}
+
+static std::string stripTrailing(std::string str) {
+    while (!str.empty() && isspace(str.back())) {
+        str.pop_back();
+    }
+    return str;
+}
 
 } // namespace
 
@@ -808,6 +921,10 @@ int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
     cygwin_internal(CW_SYNC_WINENV);
     g_wakeupFd = new WakeupFd();
+
+    if (argc == 3 && !strcmp(argv[1], "--press-return")) {
+        return handlePressReturn(argv[2]);
+    }
 
     Environment env;
     std::string spawnCwd;
@@ -970,27 +1087,27 @@ int main(int argc, char *argv[]) {
     cmdLine.append(L"\" -c ");
     appendBashArg(cmdLine, bashCmdLine);
 
-    const auto inputPipe = createPipe();
     const auto outputPipe = createPipe();
+    const auto errorPipe = createPipe();
     STARTUPINFOEXW sui {};
     sui.StartupInfo.cb = sizeof(sui);
     StartupInfoAttributeList attrList { sui.lpAttributeList, 1 };
     StartupInfoInheritList inheritList { sui.lpAttributeList,
-        {
-            inputPipe.rh,
-            outputPipe.wh,
-        }
+        { outputPipe.wh, errorPipe.wh }
     };
 
-    if (/*XXX: appropriate version */ true) {
+    if (windowsVersion() >= std::make_tuple(10u, 0u, 15063u)) {
+        // WSL was first officially shipped in 14393, but in that version,
+        // bash.exe did not allow redirecting stdout/stderr to a pipe.
+        // Redirection is allowed starting with 15063, and we'd like to use it
+        // to help report errors.
         sui.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-        sui.StartupInfo.hStdInput = inputPipe.rh;
         sui.StartupInfo.hStdOutput = outputPipe.wh;
-        sui.StartupInfo.hStdError = outputPipe.wh;
+        sui.StartupInfo.hStdError = errorPipe.wh;
     }
 
     PROCESS_INFORMATION pi = {};
-    const BOOL success = CreateProcessW(bashPath.c_str(), &cmdLine[0], nullptr, nullptr,
+    BOOL success = CreateProcessW(bashPath.c_str(), &cmdLine[0], nullptr, nullptr,
         true,
         debugFork ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW,
         nullptr, nullptr, &sui.StartupInfo, &pi);
@@ -999,35 +1116,31 @@ int main(int argc, char *argv[]) {
             formatErrorMessage(GetLastError()).c_str());
     }
 
-    CloseHandle(inputPipe.rh);
     CloseHandle(outputPipe.wh);
+    CloseHandle(errorPipe.wh);
+    success = SetHandleInformation(pi.hProcess, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    assert(success && "SetHandleInformation failed");
+    spawnPressReturnProcess(pi.hProcess);
 
     std::atomic<bool> backendStarted = { false };
-    std::string bashError;
-
-    auto readBashErrorThread = std::thread([&]() {
-        char buf[1024];
-        DWORD actual {};
-        bool sentChar {};
-        while (ReadFile(outputPipe.rh, buf, sizeof(buf), &actual, nullptr) && actual > 0) {
-            bashError.append(buf, buf + actual);
-            if (!sentChar && !backendStarted) {
-                // If bash.exe prints an error before we've connected to the
-                // backend, then it may have put up a "Press any key to continue"
-                // prompt.  Dismiss it here by sending it something.
-                WriteFile(inputPipe.wh, "\n", 1, &actual, nullptr);
-                sentChar = true;
-            }
-        }
-    });
 
     // If the backend process exits before the frontend, then something has
     // gone wrong.
     const auto watchdog = std::thread([&]() {
         WaitForSingleObject(pi.hProcess, INFINITE);
-        // Because bash.exe has exited, we know that outputPipe's write end has
-        // closed.  Finish reading anything bash.exe wrote.
-        readBashErrorThread.join();
+
+        // Because bash.exe has exited, we know that the write ends of the
+        // output pipes are closed.  Finish reading anything bash.exe wrote.
+        // bash.exe writes at least one error via stdout in UTF-16;
+        // wslbridge-backend could write to stderr in UTF-8.
+        auto outVec = readAllFromHandle(outputPipe.rh);
+        auto errVec = readAllFromHandle(errorPipe.rh);
+        std::wstring outWide(outVec.size() / sizeof(wchar_t), L'\0');
+        memcpy(&outWide[0], outVec.data(), outWide.size() * sizeof(wchar_t));
+        std::string out { wcsToMbs(outWide, true) };
+        std::string err { errVec.begin(), errVec.end() };
+        out = stripTrailing(replaceAll(out, "Press any key to continue...", ""));
+
         std::string msg;
         if (backendStarted) {
             msg = "\nwslbridge error: backend process died\n";
@@ -1047,18 +1160,13 @@ int main(int argc, char *argv[]) {
                            "note: WSL only supports local NTFS volumes\n");
             }
         }
-        if (!bashError.empty()) {
-            if (!backendStarted && bashError.size() % 2 == 0) {
-                std::wstring wideError(
-                    reinterpret_cast<const wchar_t*>(bashError.c_str()),
-                    reinterpret_cast<const wchar_t*>(bashError.c_str() + bashError.size()));
-                const auto x = wcsToMbs(wideError, true);
-                if (!x.empty()) {
-                    bashError = std::move(x);
-                }
-            }
+        if (!out.empty()) {
             msg.append("note: bash.exe output: ");
-            msg.append(bashError);
+            msg.append(out);
+        }
+        if (!err.empty()) {
+            msg.append("note: backend error output: ");
+            msg.append(err);
         }
         g_terminalState.fatal("%s", msg.c_str());
     });
