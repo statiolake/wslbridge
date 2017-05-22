@@ -128,9 +128,12 @@ static std::wstring mbsToWcs(const std::string &s) {
     return ret;
 }
 
-static std::string wcsToMbs(const std::wstring &s) {
+static std::string wcsToMbs(const std::wstring &s, bool emptyOnError=false) {
     const size_t len = wcstombs(nullptr, s.c_str(), 0);
     if (len == static_cast<size_t>(-1)) {
+        if (emptyOnError) {
+            return {};
+        }
         fatal("error: wcsToMbs: invalid string\n");
     }
     std::string ret;
@@ -748,6 +751,57 @@ static std::string formatErrorMessage(DWORD err) {
     return ret;
 }
 
+struct PipeHandles {
+    HANDLE rh;
+    HANDLE wh;
+};
+
+static PipeHandles createPipe() {
+    SECURITY_ATTRIBUTES sa {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    PipeHandles ret {};
+    const BOOL success = CreatePipe(&ret.rh, &ret.wh, &sa, 0);
+    assert(success && "CreatePipe failed");
+    return ret;
+}
+
+class StartupInfoAttributeList {
+public:
+    StartupInfoAttributeList(PPROC_THREAD_ATTRIBUTE_LIST &attrList, int count) {
+        SIZE_T size {};
+        InitializeProcThreadAttributeList(nullptr, count, 0, &size);
+        assert(size > 0 && "InitializeProcThreadAttributeList failed");
+        buffer_ = std::unique_ptr<char[]>(new char[size]);
+        const BOOL success = InitializeProcThreadAttributeList(get(), 1, 0, &size);
+        assert(success && "InitializeProcThreadAttributeList failed");
+        attrList = get();
+    }
+    ~StartupInfoAttributeList() {
+        DeleteProcThreadAttributeList(get());
+    }
+private:
+    PPROC_THREAD_ATTRIBUTE_LIST get() {
+        return reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(buffer_.get());
+    }
+    std::unique_ptr<char[]> buffer_;
+};
+
+class StartupInfoInheritList {
+public:
+    StartupInfoInheritList(PPROC_THREAD_ATTRIBUTE_LIST attrList,
+                           std::vector<HANDLE> &&inheritList) :
+            inheritList_(std::move(inheritList)) {
+        const BOOL success = UpdateProcThreadAttribute(
+            attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inheritList_.data(), inheritList_.size() * sizeof(HANDLE),
+            nullptr, nullptr);
+        assert(success && "UpdateProcThreadAttribute failed");
+    }
+private:
+    std::vector<HANDLE> inheritList_;
+};
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -916,53 +970,27 @@ int main(int argc, char *argv[]) {
     cmdLine.append(L"\" -c ");
     appendBashArg(cmdLine, bashCmdLine);
 
-
-
-    BOOL success {};
-    SECURITY_ATTRIBUTES secAttr {};
-    secAttr = { sizeof(secAttr), nullptr, true };
-    HANDLE failInputRead {}, failInputWrite {};
-    success = CreatePipe(&failInputRead, &failInputWrite, &secAttr, 0);
-    assert(success && "CreatePipe failed");
-    secAttr = { sizeof(secAttr), nullptr, true };
-    HANDLE failOutputRead {}, failOutputWrite {};
-    success = CreatePipe(&failOutputRead, &failOutputWrite, &secAttr, 0);
-    assert(success && "CreatePipe failed");
-
-
-
-
-
-
+    const auto inputPipe = createPipe();
+    const auto outputPipe = createPipe();
     STARTUPINFOEXW sui {};
     sui.StartupInfo.cb = sizeof(sui);
+    StartupInfoAttributeList attrList { sui.lpAttributeList, 1 };
+    StartupInfoInheritList inheritList { sui.lpAttributeList,
+        {
+            inputPipe.rh,
+            outputPipe.wh,
+        }
+    };
 
-
-
-    SIZE_T size {};
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
-    assert(size > 0 && "InitializeProcThreadAttributeList failed");
-    std::unique_ptr<char[]> attrListBuffer(new char[size]);
-    PPROC_THREAD_ATTRIBUTE_LIST attrList =
-        reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attrListBuffer.get());
-    sui.lpAttributeList = attrList;
-    success = InitializeProcThreadAttributeList(attrList, 1, 0, &size);
-    assert(success && "InitializeProcThreadAttributeList failed");
-
-
-
-    HANDLE inheritList[] = { failInputRead, failOutputWrite };
-    success = UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        inheritList, sizeof(inheritList), nullptr, nullptr);
-    assert(success && "UpdateProcThreadAttribute failed");
-
-
-
-
-
+    if (/*XXX: appropriate version */ true) {
+        sui.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        sui.StartupInfo.hStdInput = inputPipe.rh;
+        sui.StartupInfo.hStdOutput = outputPipe.wh;
+        sui.StartupInfo.hStdError = outputPipe.wh;
+    }
 
     PROCESS_INFORMATION pi = {};
-    success = CreateProcessW(bashPath.c_str(), &cmdLine[0], nullptr, nullptr,
+    const BOOL success = CreateProcessW(bashPath.c_str(), &cmdLine[0], nullptr, nullptr,
         true,
         debugFork ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW,
         nullptr, nullptr, &sui.StartupInfo, &pi);
@@ -970,30 +998,67 @@ int main(int argc, char *argv[]) {
         fatal("error starting bash.exe adapter: %s\n",
             formatErrorMessage(GetLastError()).c_str());
     }
-    DeleteProcThreadAttributeList(attrList);
+
+    CloseHandle(inputPipe.rh);
+    CloseHandle(outputPipe.wh);
 
     std::atomic<bool> backendStarted = { false };
+    std::string bashError;
+
+    auto readBashErrorThread = std::thread([&]() {
+        char buf[1024];
+        DWORD actual {};
+        bool sentChar {};
+        while (ReadFile(outputPipe.rh, buf, sizeof(buf), &actual, nullptr) && actual > 0) {
+            bashError.append(buf, buf + actual);
+            if (!sentChar && !backendStarted) {
+                // If bash.exe prints an error before we've connected to the
+                // backend, then it may have put up a "Press any key to continue"
+                // prompt.  Dismiss it here by sending it something.
+                WriteFile(inputPipe.wh, "\n", 1, &actual, nullptr);
+                sentChar = true;
+            }
+        }
+    });
 
     // If the backend process exits before the frontend, then something has
     // gone wrong.
     const auto watchdog = std::thread([&]() {
         WaitForSingleObject(pi.hProcess, INFINITE);
+        // Because bash.exe has exited, we know that outputPipe's write end has
+        // closed.  Finish reading anything bash.exe wrote.
+        readBashErrorThread.join();
+        std::string msg;
         if (backendStarted) {
-            g_terminalState.fatal("\nwslbridge error: backend process died\n");
+            msg = "\nwslbridge error: backend process died\n";
+        } else {
+            msg = "wslbridge error: failed to start backend process\n";
+            msg.append("note: backend program is at '");
+            msg.append(wcsToMbs(backendPathWin));
+            msg.append("'\n");
+            if (access(wcsToMbs(backendPathWin).c_str(), X_OK) == -1 && errno == EACCES) {
+                msg.append("note: the backend file is not executable "
+                           "(use 'chmod +x' on it?)\n");
+            }
+            if (fsname != L"NTFS") {
+                msg.append("note: backend is on a volume of type '");
+                msg.append(wcsToMbs(fsname));
+                msg.append("', expected 'NTFS'\n"
+                           "note: WSL only supports local NTFS volumes\n");
+            }
         }
-        std::string msg = "wslbridge error: failed to start backend process\n";
-        msg.append("note: backend program is at '");
-        msg.append(wcsToMbs(backendPathWin));
-        msg.append("'\n");
-        if (access(wcsToMbs(backendPathWin).c_str(), X_OK) == -1 && errno == EACCES) {
-            msg.append("note: the backend file is not executable "
-                       "(use 'chmod +x' on it?)\n");
-        }
-        if (fsname != L"NTFS") {
-            msg.append("note: backend is on a volume of type '");
-            msg.append(wcsToMbs(fsname));
-            msg.append("', expected 'NTFS'\n"
-                       "note: WSL only supports local NTFS volumes\n");
+        if (!bashError.empty()) {
+            if (!backendStarted && bashError.size() % 2 == 0) {
+                std::wstring wideError(
+                    reinterpret_cast<const wchar_t*>(bashError.c_str()),
+                    reinterpret_cast<const wchar_t*>(bashError.c_str() + bashError.size()));
+                const auto x = wcsToMbs(wideError, true);
+                if (!x.empty()) {
+                    bashError = std::move(x);
+                }
+            }
+            msg.append("note: bash.exe output: ");
+            msg.append(bashError);
         }
         g_terminalState.fatal("%s", msg.c_str());
     });
